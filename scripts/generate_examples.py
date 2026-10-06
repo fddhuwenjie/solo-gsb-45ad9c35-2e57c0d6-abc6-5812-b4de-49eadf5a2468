@@ -125,6 +125,27 @@ def main() -> None:
                        "sentence": sentence(1, 1, "", "A", payload, fill)}],
     }
 
+    # 1c. same report with a second longitude, plus both reports re-sent as
+    # two fragments without sequence id: the two fragment-1s sharing one
+    # fragment-2 form an ambiguous pool of position reports (used by the
+    # /track README example and the track tests) -----------------------------
+    other_payload, _ = armor(msg1_bits(
+        mmsi=366999999, lon=-73.980087, lat=40.7484,
+        sog=8.4, cog=121.5, heading=119, nav_status=0, timestamp=34,
+    ))
+    out["position_split"] = {
+        "sentences": [
+            {"source_id": "ais-receiver-1",
+             "sentence": sentence(1, 1, "", "A", other_payload, 0)},
+            {"source_id": "ais-receiver-1",
+             "sentence": sentence(2, 1, "", "A", payload[:20], 0)},
+            {"source_id": "ais-receiver-1",
+             "sentence": sentence(2, 1, "", "A", other_payload[:20], 0)},
+            {"source_id": "ais-receiver-1",
+             "sentence": sentence(2, 2, "", "A", payload[20:], fill)},
+        ],
+    }
+
     # 1b. single-fragment !AIVDO with "not available" sentinels --------------
     payload, fill = armor(msg1_bits(
         mmsi=366999999, lon=181.0, lat=40.7484,

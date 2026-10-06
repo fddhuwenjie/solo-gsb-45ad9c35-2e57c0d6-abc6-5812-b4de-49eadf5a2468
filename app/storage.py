@@ -14,6 +14,17 @@ Whole decoded messages are stored as-is — a position report whose
 coordinates are "not available" (null) is stored with null coordinates;
 no fields are borrowed from older messages.
 
+``vessel_track``: one row per ``(source_id, mmsi, observed_at)`` holding a
+decoded position report (message types 1/2/3) — the time-ordered track
+behind ``GET /track``. Rows are appended with ``INSERT OR IGNORE``: the
+first message saved for an instant wins and re-submissions add no point,
+while a late old observation still extends the track (it just cannot roll
+back the ``vessel_state`` snapshot). Track points commit in the same
+transaction as the corresponding snapshot write (``/ingest``) or the review
+resolution, so the two never diverge. Databases written before this table
+existed are seeded on open: every stored position snapshot becomes one
+starting point per vessel; no earlier history is invented.
+
 ``review_batch``: one row per manual-review batch created from an ambiguous
 batch of sentences. The original sentences and the full decode outcome
 (including every candidate of every ambiguous pool) are stored as JSON, so
@@ -60,6 +71,14 @@ CREATE TABLE IF NOT EXISTS review_batch (
     results      TEXT NOT NULL,
     resolution   TEXT
 );
+
+CREATE TABLE IF NOT EXISTS vessel_track (
+    source_id   TEXT NOT NULL,
+    mmsi        INTEGER NOT NULL,
+    observed_at TEXT NOT NULL,
+    data        TEXT NOT NULL,
+    PRIMARY KEY (source_id, mmsi, observed_at)
+);
 """
 
 _UPSERT_SQL = """
@@ -69,6 +88,21 @@ ON CONFLICT (source_id, mmsi, kind) DO UPDATE SET
     observed_at = excluded.observed_at,
     data = excluded.data
 WHERE excluded.observed_at > vessel_state.observed_at
+"""
+
+_TRACK_INSERT_SQL = """
+INSERT OR IGNORE INTO vessel_track (source_id, mmsi, observed_at, data)
+VALUES (?, ?, ?, ?)
+"""
+
+# Migration for databases written before tracks existed: every stored
+# position snapshot becomes one starting track point per vessel. Idempotent
+# (INSERT OR IGNORE), so it is a no-op on databases that already have tracks.
+_TRACK_SEED_SQL = """
+INSERT OR IGNORE INTO vessel_track (source_id, mmsi, observed_at, data)
+SELECT source_id, mmsi, observed_at, data
+FROM vessel_state
+WHERE kind = 'position'
 """
 
 
@@ -86,7 +120,7 @@ def _parse_observed_at(text: str) -> datetime:
 
 
 class SnapshotStore:
-    """Thread-safe SQLite-backed store of the latest message per vessel."""
+    """Thread-safe SQLite-backed store: snapshots, tracks, review batches."""
 
     def __init__(self, path: str):
         self._conn = sqlite3.connect(path, check_same_thread=False)
@@ -94,6 +128,7 @@ class SnapshotStore:
         self._lock = threading.Lock()
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
+            self._conn.execute(_TRACK_SEED_SQL)
 
     def close(self) -> None:
         with self._lock:
@@ -116,6 +151,20 @@ class SnapshotStore:
         )
         return cursor.rowcount > 0
 
+    def _insert_track_row(
+        self, source_id: str, mmsi: int, observed_at: str, data: dict
+    ) -> None:
+        """Append one track point; caller must hold the lock and transaction.
+
+        The primary key makes the first message saved for a
+        ``(source_id, mmsi, observed_at)`` instant win; later duplicates
+        (re-submitted batches, equal-time messages) are ignored.
+        """
+        payload = json.dumps(data, separators=(",", ":"), sort_keys=True)
+        self._conn.execute(
+            _TRACK_INSERT_SQL, (source_id, mmsi, observed_at, payload)
+        )
+
     def upsert_if_newer(
         self,
         source_id: str,
@@ -128,8 +177,15 @@ class SnapshotStore:
 
         *observed_at* must be normalised with :func:`normalize_observed_at`.
         Returns True when the row was (re)written.
+
+        Position reports (kind ``'position'``) also append a track point in
+        the same transaction, so a snapshot and its track point commit
+        together. The track point is unconditional: a late old observation
+        still extends the track even though the newer snapshot is kept.
         """
         with self._lock, self._conn:
+            if kind == KIND_POSITION:
+                self._insert_track_row(source_id, mmsi, observed_at, data)
             return self._upsert_row(source_id, mmsi, kind, observed_at, data)
 
     # -- reads ----------------------------------------------------------------
@@ -199,6 +255,29 @@ class SnapshotStore:
             for (src, mmsi), rows in sorted(grouped.items())
         ]
 
+    # -- position track -------------------------------------------------------
+
+    def get_track(self, source_id: str, mmsi: int) -> list[TimedPositionReport]:
+        """Every stored track point of one vessel, oldest first."""
+        with self._lock:
+            rows = list(
+                self._conn.execute(
+                    """
+                    SELECT observed_at, data FROM vessel_track
+                    WHERE source_id = ? AND mmsi = ?
+                    ORDER BY observed_at
+                    """,
+                    (source_id, mmsi),
+                ).fetchall()
+            )
+        return [
+            TimedPositionReport(
+                observed_at=_parse_observed_at(row["observed_at"]),
+                data=PositionReport(**json.loads(row["data"])),
+            )
+            for row in rows
+        ]
+
     # -- review batches -------------------------------------------------------
 
     def create_review(
@@ -247,10 +326,13 @@ class SnapshotStore:
 
         *writes* are ``(source_id, mmsi, kind, observed_at, data)`` tuples in
         original-sentence-index order; each is applied with the usual
-        strictly-newer rule, so newer snapshots are never rolled back. The
-        status flip and every write commit or roll back together. Returns
-        the involved vessels' snapshots as actually stored, or ``None`` when
-        the batch is unknown or already resolved (nothing is written then).
+        strictly-newer rule, so newer snapshots are never rolled back.
+        Position writes additionally append track points (first saved wins
+        per instant), even when a newer snapshot makes the snapshot write a
+        no-op. The status flip, the snapshot writes and the track points
+        commit or roll back together. Returns the involved vessels'
+        snapshots as actually stored, or ``None`` when the batch is unknown
+        or already resolved (nothing is written then).
         """
         with self._lock, self._conn:
             row = self._conn.execute(
@@ -259,6 +341,8 @@ class SnapshotStore:
             if row is None or row["status"] != "pending":
                 return None
             for source_id, mmsi, kind, observed_at, data in writes:
+                if kind == KIND_POSITION:
+                    self._insert_track_row(source_id, mmsi, observed_at, data)
                 self._upsert_row(source_id, mmsi, kind, observed_at, data)
             involved = sorted({(w[0], w[1]) for w in writes})
             snapshots = [

@@ -32,3 +32,13 @@ AMBIG_F1B = "!AIVDM,2,1,,B,55M2oPP2:N0p888;;;9<uE@PE8r0=8u=<000001@;@I796i9,0*43
 AMBIG_F2 = "!AIVDM,2,2,,B,0B0Slm3kP00000000000000,2*3F"
 
 INCOMPLETE_F1 = "!AIVDM,2,1,9,A,55Mwqgh2:N2UL@?7;?@mJ0<h5D@D000000000016?0N:<6Lf,0*53"
+
+# Same MMSI as SINGLE_FRAGMENT (366999999) but a different longitude.
+OTHER_POSITION = "!AIVDM,1,1,,A,15Mwqgh01DreF9HGD@44gkg40000,0*1F"
+
+# SINGLE_PAYLOAD re-sent as two fragments without sequence id; POS_SPLIT_F1B
+# carries the OTHER_POSITION longitude. The two fragment-1s sharing
+# POS_SPLIT_F2 form an ambiguous pool of decodable position reports.
+POS_SPLIT_F1A = "!AIVDM,2,1,,A,15Mwqgh01DreE9HGD@44,0*40"
+POS_SPLIT_F1B = "!AIVDM,2,1,,A,15Mwqgh01DreF9HGD@44,0*43"
+POS_SPLIT_F2 = "!AIVDM,2,2,,A,gkg40000,0*79"

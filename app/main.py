@@ -30,6 +30,7 @@ from .models import (
     ReviewStatus,
     SentenceIn,
     Summary,
+    TimedPositionReport,
     VesselSnapshot,
 )
 from .nmea import Fragment, SentenceError, parse_sentence
@@ -56,10 +57,12 @@ app = FastAPI(
         "ambiguity) and decodes AIS message types 1/2/3 and 5. POST /ingest "
         "additionally maintains persistent per-(source_id, MMSI) snapshots "
         "of the latest position and static/voyage messages, queryable via "
-        "GET /vessels. Ambiguous batches can be stored via POST /reviews "
+        "GET /vessels. Every stored position report (message 1/2/3) also "
+        "appends to a per-(source_id, MMSI) track, queryable in time order "
+        "via GET /track. Ambiguous batches can be stored via POST /reviews "
         "for manual review; a human picks one listed candidate per ambiguous "
         "pool and POST /reviews/{batch_id}/resolve applies the selection "
-        "to the snapshots atomically."
+        "to the snapshots and tracks atomically."
     ),
 )
 
@@ -169,8 +172,10 @@ def _apply_to_store(
     *results* is sorted by first sentence index, so when one batch carries
     several messages of the same class for a vessel, the first one wins
     (later ones share the batch ``observed_at`` and lose the strictly-newer
-    comparison). Errors, incomplete groups and ambiguous candidates never
-    reach the store.
+    comparison). Position reports also append one track point per
+    (source_id, MMSI, observed_at) instant — first saved wins — in the same
+    transaction as the snapshot write. Errors, incomplete groups and
+    ambiguous candidates never reach the store.
     """
     involved: set[tuple[str, int]] = set()
     for result in results:
@@ -234,6 +239,24 @@ def ingest(request: IngestRequest):
 )
 def list_vessels(source_id: Optional[str] = None, mmsi: Optional[int] = None):
     return get_store().list_snapshots(source_id=source_id, mmsi=mmsi)
+
+
+@app.get(
+    "/track",
+    response_model=list[TimedPositionReport],
+    tags=["track"],
+    description=(
+        "Position track of one (source_id, MMSI) pair: every stored "
+        "position report (message 1/2/3) with its batch observed_at, in "
+        "ascending time order. Late-arriving old observations appear in "
+        "their time position without rolling back the /vessels snapshot; "
+        "points whose coordinates were not available keep null values. "
+        "One (source_id, MMSI, observed_at) instant holds the first message "
+        "saved for it, so re-submitted batches add no points."
+    ),
+)
+def get_track(source_id: str, mmsi: int):
+    return get_store().get_track(source_id, mmsi)
 
 
 # ---------------------------------------------------------------------------
@@ -372,8 +395,9 @@ def resolve_review(batch_id: str, request: ReviewResolveRequest):
 
     Every message is written under the batch ``observed_at`` in original
     sentence-index order (first index wins for one vessel and class). The
-    status flip and the snapshot writes commit atomically; a newer snapshot
-    already stored is never rolled back, but the batch is still marked
+    status flip, the snapshot writes and the position track points commit
+    atomically; a newer snapshot already stored is never rolled back (its
+    older track point is still appended), but the batch is still marked
     resolved and the response carries the snapshots actually stored.
     """
     store = get_store()
