@@ -4,7 +4,9 @@
 `POST /decode` 接收同一批次、带 `source_id` 的原始 `!AIVDM` / `!AIVDO` 语句，
 完成校验、乱序分片重组、歧义枚举与六位 payload 解码。
 `POST /ingest` 在此基础上携带本批 UTC 观测时间 `observed_at`，把成功解码的消息
-按 `(source_id, MMSI)` 持久化为可查询的船舶快照（SQLite），并提供 `GET /vessels` 查询。
+按 `(source_id, MMSI)` 持久化为可查询的船舶快照（SQLite），并提供 `GET /vessels` 查询；
+每条成功解码的船位（消息 1/2/3）还会追加到**可按时间回看的船位轨迹**，由 `GET /tracks`
+按 `observed_at` 升序回放。
 对无 `sequence_id` 的歧义批，`POST /reviews` 可建立**待核定批**（保存原批与各歧义池全部候选，
 不写快照），由人工核定后经 `POST /reviews/{batch_id}/resolve` 把选定候选连同本批明确解码结果
 原子写入快照；`GET /reviews` / `GET /reviews/{batch_id}` 随时查询待核定批、候选与核定结果。
@@ -35,6 +37,14 @@
   - 整条消息原样保存：新船位坐标为 `null` 时保留 `null`，**不借用历史坐标**；
   - 错误、缺片与歧义候选**不写入**快照；歧义批仍返回 409，但其中明确解码的消息**仍更新**快照；
   - 本地 **SQLite** 持久化，Compose 重启后仍可查询。
+- **船位轨迹（`GET /tracks`）**：
+  - `/ingest` 成功解码的船位（消息 1/2/3）按原语句下标逐点写入，**迟到的旧观测仍保留在轨迹中**
+    （只是不回滚 `/vessels` 最新快照），可按 `observed_at` 升序完整回看；
+  - 同源同船同一 `observed_at` **只保留最先保存的一条**（`INSERT OR IGNORE`），重复提交、
+    同批多条同时间船位都不会增加轨迹点；坐标为 `null` 的点原样保留，不借用相邻位置；
+  - 建待核定批、无效报文、缺片与**未选中候选**均不生成轨迹点；普通入库时轨迹点与快照在
+    **同一事务**提交，核定时轨迹点、快照与核定状态一同成功或回滚；
+  - 打开旧版数据库时，现存的每船一条船位快照自动作为该船轨迹的**唯一起点**，不推断更早航迹。
 - **歧义批人工核定（`/reviews`）**：
   - `POST /reviews` 提交原语句与 `observed_at` 建立**待核定批**：复用同一套校验/重组/解码，
     持久保存原批与各歧义池的全部候选并返回批次 ID；**仅接受存在歧义的批次**，**建批时不写快照**；
@@ -72,7 +82,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 71 个单元/集成测试
+pytest -q          # 87 个单元/集成测试
 ```
 
 ## API
@@ -138,8 +148,9 @@ HTTP 状态码：
 | 新旧比较 | 仅当新消息的 `observed_at` **严格更新**才覆盖；旧批不得回滚新状态 |
 | 同时间 | **先保存者优先**（后到的同时间批次不覆盖） |
 | 同批多条同类 | 按原语句下标取**首条** |
-| null 坐标 | 新船位坐标为 `null` 时保留 `null`，不借用历史坐标 |
-| 不写入 | 错误、缺片、歧义候选不写入快照 |
+| null 坐标 | 新船位坐标为 `null` 时保留 `null`，不借用历史坐标（快照与轨迹点均如此） |
+| 不写入 | 错误、缺片、歧义候选不写入快照（也不生成轨迹点） |
+| 轨迹 | 每条船位另按 `(source_id, MMSI, observed_at)` 追加到 `vessel_track`，迟到旧点保留、同时间去重，详见 `GET /tracks` |
 
 ### `GET /vessels`
 
@@ -168,6 +179,45 @@ GET /vessels?source_id=ais-receiver-1&mmsi=366999999
 
 `position`（消息 1/2/3）与 `static`（消息 5）是两条独立时间线，各自携带写入时的
 批次 `observed_at`；对应消息类尚未解码到时该侧为 `null`。
+
+### `GET /tracks`
+
+按来源和 MMSI 查询一船的**完整船位轨迹**。两个查询参数均为**必填**
+（缺参返回 `422`；该来源/MMSI 无任何数据返回 `404`；只解到过消息 5 的船
+返回 `200` 且 `points` 为空数组）：
+
+```
+GET /tracks?source_id=ais-receiver-1&mmsi=366999999
+```
+
+```bash
+curl -s 'http://localhost:8000/tracks?source_id=ais-receiver-1&mmsi=366999999'
+```
+
+轨迹按 `observed_at` **升序**返回每个成功保存的消息 1/2/3 船位；迟到的旧观测
+照样在列（即便它没有回滚 `/vessels` 最新快照），同一 `observed_at` 的重复提交
+不产生重复点，坐标 `null` 原样保留：
+
+```json
+{
+  "source_id": "ais-receiver-1",
+  "mmsi": 366999999,
+  "points": [
+    { "observed_at": "2026-10-05T11:00:00Z",
+      "data": { "message_type": 1, "mmsi": 366999999, "longitude": -73.98009, "latitude": 40.7484, "...": "..." } },
+    { "observed_at": "2026-10-05T12:00:00Z",
+      "data": { "message_type": 1, "mmsi": 366999999, "longitude": -73.9835, "latitude": 40.7484, "...": "..." } },
+    { "observed_at": "2026-10-05T13:00:00Z",
+      "data": { "message_type": 1, "mmsi": 366999999, "longitude": null, "latitude": 40.7484, "...": "..." } }
+  ]
+}
+```
+
+| 状态码 | 含义 |
+| ------ | ---- |
+| `200` | 返回轨迹（无船位点时 `points` 为 `[]`） |
+| `404` | 该 `(source_id, MMSI)` 没有任何已保存数据 |
+| `422` | 缺少必填查询参数 `source_id` 或 `mmsi` |
 
 ### `POST /reviews`（建立待核定批）
 
@@ -273,6 +323,66 @@ curl -s -X POST http://localhost:8000/reviews/e9b441effb2d442f8dff0052f9ff3eee/r
 
 核定前若已有更晚 `observed_at` 的观测写入同一 `(source_id, MMSI, 消息类)`，较新快照
 **不回滚**；批次仍记为已核定，响应与后续 `GET /reviews/{batch_id}` 返回实际保存的快照。
+
+#### 迟到观测与迟到核定示例
+
+船位轨迹与快照的时序差异可用下面三步复现。先写入 `12:00` 船位，再迟到提交
+`11:00` 船位：轨迹保留两点，快照仍是 `12:00`。
+
+```bash
+# 1) 12:00 的船位
+curl -s -X POST http://localhost:8000/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{"observed_at":"2026-10-05T12:00:00Z",
+       "sentences":[{"source_id":"ais-receiver-1",
+                     "sentence":"!AIVDM,1,1,,A,15Mwqgh01DreE9HGD@44gkg40000,0*1C"}]}'
+
+# 2) 迟到的 11:00 船位（更旧）：进入轨迹，但快照不回滚
+curl -s -X POST http://localhost:8000/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{"observed_at":"2026-10-05T11:00:00Z",
+       "sentences":[{"source_id":"ais-receiver-1",
+                     "sentence":"!AIVDM,1,1,,A,15Mwqgh01DreF9HGD@44gkg40000,0*1F"}]}'
+
+# 3) 回看轨迹：两点按 observed_at 升序；/vessels 仍停在 12:00
+curl -s 'http://localhost:8000/tracks?source_id=ais-receiver-1&mmsi=366999999'
+```
+
+歧义批**迟到核定**（建批时间早于已入库的更新观测）时，核定写入的旧船位同样进入轨迹，
+而 `/vessels` 最新快照保持不回滚：
+
+```bash
+# 1) 09:30 建立待核定批（含一条明确船位 + 一个歧义静态消息池）
+BATCH=$(curl -s -X POST http://localhost:8000/reviews \
+  -H 'Content-Type: application/json' \
+  -d '{"observed_at":"2026-10-05T09:30:00Z","sentences":[
+        {"source_id":"ais-receiver-2",
+         "sentence":"!AIVDM,1,1,,A,15Mwqgh01DreE9HGD@44gkg40000,0*1C"},
+        {"source_id":"ais-receiver-2",
+         "sentence":"!AIVDM,2,1,,B,55M2oP@2:N0l4447774pu9@PE8r1=@5800000016<PD886P`,0*40"},
+        {"source_id":"ais-receiver-2",
+         "sentence":"!AIVDM,2,1,,B,55M2oPP2:N0p888;;;9<uE@PE8r0=8u=<000001@;@I796i9,0*43"},
+        {"source_id":"ais-receiver-2",
+         "sentence":"!AIVDM,2,2,,B,0B0Slm3kP00000000000000,2*3F"}]}' \
+  | python3 -c 'import sys,json;print(json.load(sys.stdin)["batch_id"])')
+
+# 2) 核定前，同船 12:00 的更新船位已经正常入库
+curl -s -X POST http://localhost:8000/ingest \
+  -H 'Content-Type: application/json' \
+  -d '{"observed_at":"2026-10-05T12:00:00Z",
+       "sentences":[{"source_id":"ais-receiver-2",
+                     "sentence":"!AIVDM,1,1,,A,15Mwqgh01DreF9HGD@44gkg40000,0*1F"}]}'
+
+# 3) 人工迟到核定（批内观测时间仍是 09:30）：旧船位进轨迹，快照保持 12:00
+curl -s -X POST "http://localhost:8000/reviews/$BATCH/resolve" \
+  -H 'Content-Type: application/json' -d '{"selections":[[1,3]]}'
+
+# 轨迹含 09:30（核定写入）与 12:00（先前入库）两点，升序返回
+curl -s 'http://localhost:8000/tracks?source_id=ais-receiver-2&mmsi=366999999'
+```
+
+若核定请求缺选、伪造候选或选中解码失败的候选，整批拒绝——轨迹点、快照与
+`review_batch` 状态一起回滚，不留部分写入。
 
 ### 哨兵值 → `null`
 
@@ -503,8 +613,10 @@ curl -s 'http://localhost:8000/vessels?source_id=ais-receiver-1&mmsi=366999999'
 
 时序行为示例：先以 `observed_at=2026-10-05T08:30:00Z` 写入船位后，再以
 `observed_at=2026-10-05T08:00:00Z`（更早）提交同一船舶的另一船位——快照保持
-`08:30` 的状态不变；而以 `observed_at=2026-10-05T09:00:00Z` 提交坐标为 `null`
-的 `!AIVDO` 船位后，快照坐标即为 `null`（不回填历史坐标）。
+`08:30` 的状态不变，但 `GET /tracks` 轨迹同时保留 `08:00` 与 `08:30` 两点；
+而以 `observed_at=2026-10-05T09:00:00Z` 提交坐标为 `null`
+的 `!AIVDO` 船位后，快照坐标即为 `null`（不回填历史坐标），轨迹中该点坐标也是 `null`。
+重复提交同一 `observed_at` 的船位不会增加轨迹点。
 
 ## 设计说明
 
@@ -522,24 +634,28 @@ curl -s 'http://localhost:8000/vessels?source_id=ais-receiver-1&mmsi=366999999'
   upsert——严格更新才覆盖，天然实现“旧批不回滚、同时间先保存者优先”；`/ingest` 按
   语句下标顺序应用本批解码结果，因此同批同类首条生效。快照保存整条解码消息，
   不做字段级合并（null 坐标原样保留）。
+- **轨迹存储**：`vessel_track` 以 `(source_id, mmsi, observed_at)` 为主键、`INSERT OR
+  IGNORE` 写入，因此迟到旧观测成为轨迹中间的一点、重复提交不增点；普通入库的快照
+  upsert 与轨迹 insert 在**单个事务**内完成。首次打开旧库时把 `vessel_state` 中既有的
+  船位快照幂等地回填为每船**唯一起点**（`sentence_index = -1`），不推断更早航迹。
 - **人工核定**：待核定批的原语句、解码结果（含各歧义池全部候选）与核定结果
   （`selections` + 实际写入的快照）以 JSON 持久化在同一 SQLite 库中，重启后仍可查询；
-  核定时“应用全部快照写入 + 翻转批次状态”在**单个事务**内完成——任一失败整体回滚，
-  批次保持待核定；状态翻转带 `status='pending'` 条件，并发/重复核定只会成功一次。
+  核定时“应用全部快照与轨迹写入 + 翻转批次状态”在**单个事务**内完成——任一失败整体回滚，
+  批次保持待核定且不留任何轨迹点；状态翻转带 `status='pending'` 条件，并发/重复核定只会成功一次。
 
 ## 项目结构
 
 ```
 app/
-  main.py        # FastAPI 入口，POST /decode、/ingest、/reviews、GET /vessels、/reviews、/health
-  models.py      # Pydantic 请求/响应模型（含快照与核定批模型）
+  main.py        # FastAPI 入口，POST /decode、/ingest、/reviews、GET /vessels、/tracks、/reviews、/health
+  models.py      # Pydantic 请求/响应模型（含快照、船位轨迹与核定批模型）
   nmea.py        # NMEA 0183 语句解析与校验（XOR 校验和、分片、fill bits）
   ais.py         # 六位 armour、位提取、消息 1/2/3 与 5 解码
   assembler.py   # 归组、乱序重组、孤儿分片池歧义枚举
-  storage.py     # SQLite 快照存储与核定批持久化（含核定事务）
+  storage.py     # SQLite 快照、船位轨迹（含旧库起点回填）与核定批持久化（核定事务）
 scripts/
   generate_examples.py  # 重新生成 README/测试中的示例报文
-tests/           # pytest 单元与 API 集成测试（含快照时序语义与人工核定流程）
+tests/           # pytest 单元与 API 集成测试（含快照、轨迹时序语义与人工核定流程）
 Dockerfile
 docker-compose.yml      # 命名卷 ais-data 持久化 /data/ais.db
 requirements.txt / requirements-dev.txt

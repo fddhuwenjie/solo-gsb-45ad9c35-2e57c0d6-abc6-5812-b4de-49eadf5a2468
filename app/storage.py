@@ -14,12 +14,23 @@ Whole decoded messages are stored as-is — a position report whose
 coordinates are "not available" (null) is stored with null coordinates;
 no fields are borrowed from older messages.
 
+``vessel_track``: append-only time series of every stored position report
+(message types 1/2/3), one row per ``(source_id, mmsi, observed_at)`` —
+late (older) observations are kept in the track even though they never
+roll back the ``vessel_state`` snapshot, and a repeated submission at an
+already-stored ``observed_at`` does not add another point (``INSERT OR
+IGNORE`` keeps the first saved message). Each point records the original
+sentence index for provenance. When an older database without this table
+is opened, each vessel's existing position snapshot is copied in as a
+single starting point (``sentence_index = -1``); no earlier track is
+inferred.
+
 ``review_batch``: one row per manual-review batch created from an ambiguous
 batch of sentences. The original sentences and the full decode outcome
 (including every candidate of every ambiguous pool) are stored as JSON, so
 pending batches, their candidates and the resolution (chosen candidates plus
 the snapshots actually stored) survive restarts. Resolution applies the
-snapshot writes and flips the status in a single transaction.
+snapshot and track writes and flips the status in a single transaction.
 """
 from __future__ import annotations
 
@@ -34,11 +45,16 @@ from .models import (
     StaticAndVoyageData,
     TimedPositionReport,
     TimedStaticAndVoyageData,
+    TrackPoint,
     VesselSnapshot,
 )
 
 KIND_POSITION = "position"
 KIND_STATIC = "static"
+
+# sentence_index recorded for track points backfilled from pre-existing
+# vessel_state rows of an older database (no earlier track is inferred).
+LEGACY_TRACK_INDEX = -1
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS vessel_state (
@@ -50,6 +66,15 @@ CREATE TABLE IF NOT EXISTS vessel_state (
     PRIMARY KEY (source_id, mmsi, kind)
 );
 
+CREATE TABLE IF NOT EXISTS vessel_track (
+    source_id      TEXT NOT NULL,
+    mmsi           INTEGER NOT NULL,
+    observed_at    TEXT NOT NULL,
+    sentence_index INTEGER NOT NULL,
+    data           TEXT NOT NULL,
+    PRIMARY KEY (source_id, mmsi, observed_at)
+) WITHOUT ROWID;
+
 CREATE TABLE IF NOT EXISTS review_batch (
     batch_id     TEXT PRIMARY KEY,
     status       TEXT NOT NULL CHECK (status IN ('pending', 'resolved')),
@@ -60,6 +85,23 @@ CREATE TABLE IF NOT EXISTS review_batch (
     results      TEXT NOT NULL,
     resolution   TEXT
 );
+"""
+
+# Existing position snapshots of an older database become one starting
+# track point per vessel; INSERT OR IGNORE makes this idempotent on
+# databases that already carry track points.
+_BACKFILL_TRACK_SQL = """
+INSERT OR IGNORE INTO vessel_track
+    (source_id, mmsi, observed_at, sentence_index, data)
+SELECT source_id, mmsi, observed_at, :legacy_index, data
+FROM vessel_state
+WHERE kind = 'position'
+"""
+
+_INSERT_TRACK_SQL = """
+INSERT OR IGNORE INTO vessel_track
+    (source_id, mmsi, observed_at, sentence_index, data)
+VALUES (?, ?, ?, ?, ?)
 """
 
 _UPSERT_SQL = """
@@ -94,6 +136,11 @@ class SnapshotStore:
         self._lock = threading.Lock()
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
+            # One-time migration for older databases: existing position
+            # snapshots seed each vessel's track with a single starting point.
+            self._conn.execute(
+                _BACKFILL_TRACK_SQL, {"legacy_index": LEGACY_TRACK_INDEX}
+            )
 
     def close(self) -> None:
         with self._lock:
@@ -101,19 +148,33 @@ class SnapshotStore:
 
     # -- writes -------------------------------------------------------------
 
-    def _upsert_row(
+    def _write_message(
         self,
         source_id: str,
         mmsi: int,
         kind: str,
         observed_at: str,
         data: dict,
+        sentence_index: int = 0,
     ) -> bool:
-        """UPSERT one row; caller must hold the lock and the transaction."""
+        """Upsert the snapshot row and record a position track point.
+
+        Every position report (kind == 'position') is appended to
+        ``vessel_track`` regardless of whether it also replaces the
+        snapshot: a late older observation still enters the track, while
+        ``INSERT OR IGNORE`` keeps the first saved message for an already
+        known ``(source_id, mmsi, observed_at)``. Caller must hold the
+        lock and the transaction.
+        """
         payload = json.dumps(data, separators=(",", ":"), sort_keys=True)
         cursor = self._conn.execute(
             _UPSERT_SQL, (source_id, mmsi, kind, observed_at, payload)
         )
+        if kind == KIND_POSITION:
+            self._conn.execute(
+                _INSERT_TRACK_SQL,
+                (source_id, mmsi, observed_at, sentence_index, payload),
+            )
         return cursor.rowcount > 0
 
     def upsert_if_newer(
@@ -124,13 +185,35 @@ class SnapshotStore:
         observed_at: str,
         data: dict,
     ) -> bool:
-        """Store *data* unless an equal-or-newer row already exists.
+        """Store *data* unless an equal-or-newer snapshot row already exists.
 
-        *observed_at* must be normalised with :func:`normalize_observed_at`.
-        Returns True when the row was (re)written.
+        Position reports additionally append a track point (late reports
+        still enter the track; a repeated submission at the same
+        ``observed_at`` does not duplicate it). *observed_at* must be
+        normalised with :func:`normalize_observed_at`. Returns True when
+        the snapshot row was (re)written.
         """
         with self._lock, self._conn:
-            return self._upsert_row(source_id, mmsi, kind, observed_at, data)
+            return self._write_message(source_id, mmsi, kind, observed_at, data)
+
+    def apply_ingest(
+        self,
+        writes: list[tuple[str, int, str, str, dict, int]],
+    ) -> list[tuple[str, int]]:
+        """Apply one normal ``/ingest`` batch in a single transaction.
+
+        *writes* are
+        ``(source_id, mmsi, kind, observed_at, data, sentence_index)``
+        tuples, already ordered by original sentence index. Snapshot
+        upserts and position track inserts commit or roll back together.
+        Returns the involved vessels' ``(source_id, mmsi)`` pairs.
+        """
+        with self._lock, self._conn:
+            for source_id, mmsi, kind, observed_at, data, sentence_index in writes:
+                self._write_message(
+                    source_id, mmsi, kind, observed_at, data, sentence_index
+                )
+            return sorted({(w[0], w[1]) for w in writes})
 
     # -- reads ----------------------------------------------------------------
 
@@ -199,6 +282,46 @@ class SnapshotStore:
             for (src, mmsi), rows in sorted(grouped.items())
         ]
 
+    # -- track ----------------------------------------------------------------
+
+    def vessel_exists(self, source_id: str, mmsi: int) -> bool:
+        """True when the vessel has any stored snapshot or track point."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM vessel_state WHERE source_id = ? AND mmsi = ? LIMIT 1",
+                (source_id, mmsi),
+            ).fetchone()
+            if row is not None:
+                return True
+            row = self._conn.execute(
+                "SELECT 1 FROM vessel_track WHERE source_id = ? AND mmsi = ? LIMIT 1",
+                (source_id, mmsi),
+            ).fetchone()
+            return row is not None
+
+    def get_track(self, source_id: str, mmsi: int) -> list[TrackPoint]:
+        """All stored position reports for one vessel, oldest first.
+
+        Ordered by ``observed_at`` (then original sentence index); points
+        are stored as decoded, including null coordinates.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT observed_at, data FROM vessel_track
+                WHERE source_id = ? AND mmsi = ?
+                ORDER BY observed_at, sentence_index
+                """,
+                (source_id, mmsi),
+            ).fetchall()
+        return [
+            TrackPoint(
+                observed_at=_parse_observed_at(row["observed_at"]),
+                data=PositionReport(**json.loads(row["data"])),
+            )
+            for row in rows
+        ]
+
     # -- review batches -------------------------------------------------------
 
     def create_review(
@@ -241,16 +364,19 @@ class SnapshotStore:
         batch_id: str,
         resolved_at: str,
         selections: list[list[int]],
-        writes: list[tuple[str, int, str, str, dict]],
+        writes: list[tuple[str, int, str, str, dict, int]],
     ) -> Optional[list[VesselSnapshot]]:
-        """Apply snapshot *writes* and mark the batch resolved, atomically.
+        """Apply snapshot/track *writes* and mark the batch resolved, atomically.
 
-        *writes* are ``(source_id, mmsi, kind, observed_at, data)`` tuples in
-        original-sentence-index order; each is applied with the usual
-        strictly-newer rule, so newer snapshots are never rolled back. The
-        status flip and every write commit or roll back together. Returns
-        the involved vessels' snapshots as actually stored, or ``None`` when
-        the batch is unknown or already resolved (nothing is written then).
+        *writes* are
+        ``(source_id, mmsi, kind, observed_at, data, sentence_index)``
+        tuples in original-sentence-index order; each is applied with the
+        usual strictly-newer snapshot rule (newer snapshots are never
+        rolled back), while every position report also enters the track.
+        The status flip, every snapshot write and every track insert
+        commit or roll back together. Returns the involved vessels'
+        snapshots as actually stored, or ``None`` when the batch is
+        unknown or already resolved (nothing is written then).
         """
         with self._lock, self._conn:
             row = self._conn.execute(
@@ -258,8 +384,10 @@ class SnapshotStore:
             ).fetchone()
             if row is None or row["status"] != "pending":
                 return None
-            for source_id, mmsi, kind, observed_at, data in writes:
-                self._upsert_row(source_id, mmsi, kind, observed_at, data)
+            for source_id, mmsi, kind, observed_at, data, sentence_index in writes:
+                self._write_message(
+                    source_id, mmsi, kind, observed_at, data, sentence_index
+                )
             involved = sorted({(w[0], w[1]) for w in writes})
             snapshots = [
                 self._to_snapshot(source_id, mmsi, self._fetch_rows(source_id, mmsi))

@@ -217,6 +217,38 @@ class IngestResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Persistent position tracks
+# ---------------------------------------------------------------------------
+
+class TrackPoint(BaseModel):
+    """One stored position report (message 1/2/3) with its batch time.
+
+    Points are returned in ascending ``observed_at`` order. Coordinates
+    stay null when the source report carried the "not available" sentinel;
+    no neighbouring position is borrowed.
+    """
+
+    observed_at: datetime
+    data: PositionReport
+
+
+class VesselTrack(BaseModel):
+    """Full position history of one (source_id, MMSI) pair.
+
+    Every successfully stored position report is kept — including late
+    (older) observations — while the latest snapshot in ``GET /vessels``
+    is never rolled back. A repeated submission at an already known
+    ``observed_at`` does not add another point.
+    """
+
+    source_id: str
+    mmsi: int
+    points: list[TrackPoint] = Field(
+        ..., description="Position reports ordered by observed_at ascending."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Manual review of ambiguous batches
 # ---------------------------------------------------------------------------
 

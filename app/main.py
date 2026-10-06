@@ -31,6 +31,7 @@ from .models import (
     SentenceIn,
     Summary,
     VesselSnapshot,
+    VesselTrack,
 )
 from .nmea import Fragment, SentenceError, parse_sentence
 from .storage import (
@@ -55,8 +56,10 @@ app = FastAPI(
         "complete combinations when no sequence id is present (HTTP 409 on "
         "ambiguity) and decodes AIS message types 1/2/3 and 5. POST /ingest "
         "additionally maintains persistent per-(source_id, MMSI) snapshots "
-        "of the latest position and static/voyage messages, queryable via "
-        "GET /vessels. Ambiguous batches can be stored via POST /reviews "
+        "of the latest position and static/voyage messages and an append-only "
+        "position track (every stored type 1/2/3 report, including late "
+        "observations), queryable via GET /vessels and GET /tracks. "
+        "Ambiguous batches can be stored via POST /reviews "
         "for manual review; a human picks one listed candidate per ambiguous "
         "pool and POST /reviews/{batch_id}/resolve applies the selection "
         "to the snapshots atomically."
@@ -161,30 +164,48 @@ def _kind_of(message: MessageData) -> str:
     return KIND_POSITION if message.message_type in (1, 2, 3) else KIND_STATIC
 
 
+def _collect_writes(
+    results: list[DecodeResult], observed_at: str
+) -> list[tuple[str, int, str, str, dict, int]]:
+    """Build ordered store writes from decoded results.
+
+    Each write carries the first original sentence index of the message.
+    *results* is sorted by first sentence index, so when one batch carries
+    several messages of the same class for a vessel, the first one wins
+    (later ones share the batch ``observed_at`` and lose the strictly-newer
+    comparison, and insert no extra track point). Errors, incomplete
+    groups and ambiguous candidates never reach the store.
+    """
+    writes: list[tuple[str, int, str, str, dict, int]] = []
+    for result in results:
+        if result.status != "decoded" or result.decoded is None:
+            continue
+        message = result.decoded
+        writes.append(
+            (
+                result.source_id,
+                message.mmsi,
+                _kind_of(message),
+                observed_at,
+                message.model_dump(),
+                result.sentence_indexes[0],
+            )
+        )
+    return writes
+
+
 def _apply_to_store(
     results: list[DecodeResult], observed_at: str, store: SnapshotStore
 ) -> list[VesselSnapshot]:
     """Persist decoded messages and return the involved vessels' snapshots.
 
-    *results* is sorted by first sentence index, so when one batch carries
-    several messages of the same class for a vessel, the first one wins
-    (later ones share the batch ``observed_at`` and lose the strictly-newer
-    comparison). Errors, incomplete groups and ambiguous candidates never
-    reach the store.
+    Snapshot upserts and position track inserts commit together in one
+    transaction; a failure rolls back every write of the batch.
     """
-    involved: set[tuple[str, int]] = set()
-    for result in results:
-        if result.status != "decoded" or result.decoded is None:
-            continue
-        message = result.decoded
-        store.upsert_if_newer(
-            result.source_id, message.mmsi, _kind_of(message), observed_at,
-            message.model_dump(),
-        )
-        involved.add((result.source_id, message.mmsi))
-
+    writes = _collect_writes(results, observed_at)
+    involved = store.apply_ingest(writes)
     snapshots: list[VesselSnapshot] = []
-    for source_id, mmsi in sorted(involved):
+    for source_id, mmsi in involved:
         snapshot = store.get_snapshot(source_id, mmsi)
         if snapshot is not None:
             snapshots.append(snapshot)
@@ -234,6 +255,36 @@ def ingest(request: IngestRequest):
 )
 def list_vessels(source_id: Optional[str] = None, mmsi: Optional[int] = None):
     return get_store().list_snapshots(source_id=source_id, mmsi=mmsi)
+
+
+@app.get(
+    "/tracks",
+    response_model=VesselTrack,
+    tags=["snapshots"],
+    responses={
+        200: {"description": "Stored position reports, oldest first."},
+        404: {"description": "No data for the given (source_id, MMSI)."},
+        422: {"description": "A required query parameter is missing."},
+    },
+    description=(
+        "Replay the position track of one (source_id, MMSI) pair. Every "
+        "successfully stored message 1/2/3 is returned, ordered by "
+        "observed_at ascending; late (older) observations are included "
+        "even though they never rolled back the GET /vessels snapshot, "
+        "and a repeated submission at an already known observed_at does "
+        "not add another point. Points keep null coordinates as decoded."
+    ),
+)
+def get_track(source_id: str, mmsi: int):
+    store = get_store()
+    if not store.vessel_exists(source_id, mmsi):
+        raise HTTPException(
+            status_code=404,
+            detail=f"no data stored for source '{source_id}', MMSI {mmsi}",
+        )
+    return VesselTrack(
+        source_id=source_id, mmsi=mmsi, points=store.get_track(source_id, mmsi)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -443,8 +494,15 @@ def resolve_review(batch_id: str, request: ReviewResolveRequest):
     indexed.sort(key=lambda item: item[0])
     observed_at = normalize_observed_at(review.observed_at)
     writes = [
-        (source_id, message.mmsi, _kind_of(message), observed_at, message.model_dump())
-        for _index, source_id, message in indexed
+        (
+            source_id,
+            message.mmsi,
+            _kind_of(message),
+            observed_at,
+            message.model_dump(),
+            index,
+        )
+        for index, source_id, message in indexed
     ]
 
     resolved_at = normalize_observed_at(datetime.now(timezone.utc))
